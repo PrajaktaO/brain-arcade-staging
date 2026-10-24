@@ -33,6 +33,15 @@ function trackAnalytics(eventName, parameters = {}) {
   }
 }
 
+// Record a failed request without sending any message text or identifier.
+function trackError(action, error) {
+  trackAnalytics("game_error", {
+    game_name: "Brain Arcade",
+    action,
+    status_code: (error && error.status) || 0
+  });
+}
+
 // NEW: Prevent duplicate events for the same session.
 function trackAnalyticsOnce(eventName, parameters = {}) {
   if (!sessionId || typeof window.gtag !== "function") return;
@@ -176,7 +185,17 @@ function displayGame(data) {
   if (!gameCompleted) {
     trackAnalyticsOnce("puzzle_started", {
       game_name: "Brain Arcade",
-      puzzle_category: data.category
+      puzzle_category: data.category,
+      puzzle_date: data.puzzleDate
+    });
+  }
+
+  // A player coming back to a puzzle that already has progress.
+  if (data.completed || data.attempts > 0 || data.hintsUsed > 0) {
+    trackAnalytics("puzzle_resumed", {
+      game_name: "Brain Arcade",
+      puzzle_date: data.puzzleDate,
+      state: data.completed ? "completed" : "in_progress"
     });
   }
 
@@ -194,8 +213,10 @@ function renderCompletion(data) {
   // NEW: Record the outcome once per session.
   trackAnalyticsOnce("puzzle_completed", {
     game_name: "Brain Arcade",
+    puzzle_date: data.puzzleDate,
     solved: Boolean(data.solved),
     attempts_used: data.attempts,
+    hints_used: data.hintsUsed || 0,
     completion_time_seconds: data.elapsedSeconds
   });
 
@@ -222,6 +243,9 @@ function renderCompletion(data) {
     $("completion-message").textContent =
       "Some puzzles take a different way of thinking. Keep practising, stay curious, and try again with tomorrow's challenge.";
   }
+
+  recordResult(data);
+  renderRecord();
 
   renderShare(data);
   renderChallengeResult(data);
@@ -366,6 +390,80 @@ function buildShareText(result, choice) {
 // The message and the link, with a blank line before the link.
 function buildFullShare(result, choice) {
   return `${buildShareText(result, choice)}\n\n${getShareLink(result, choice)}`;
+}
+
+/*
+  Personal record (browser only): "Out of 15 puzzles so far, you've played 14
+  and solved 12." It is kept in this browser, is not verified and never leaves
+  it. Counting starts from the day it was introduced, because earlier days
+  were not recorded here. A puzzle is counted once, on the day it is finished.
+*/
+const RECORD_KEY = "brainArcadeRecord";
+const PUZZLE_ONE_DATE = "2026-10-14";
+
+function readRecord() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(RECORD_KEY) || "{}");
+    return stored && typeof stored.puzzles === "object" && stored.puzzles ? stored.puzzles : {};
+  } catch (error) {
+    return {};
+  }
+}
+
+function recordResult(data) {
+  if (!data || !DATE_PATTERN.test(data.puzzleDate || "")) return;
+
+  const puzzles = readRecord();
+  puzzles[data.puzzleDate] = {
+    s: data.solved ? 1 : 0,
+    a: Number(data.attempts) || 0,
+    h: Number(data.hintsUsed) || 0,
+    t: Math.round(Number(data.elapsedSeconds) || 0)
+  };
+
+  try {
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ v: 1, puzzles }));
+  } catch (error) {
+    // The record is only a convenience.
+  }
+}
+
+function daysBetween(fromIso, toIso) {
+  const [fy, fm, fd] = fromIso.split("-").map(Number);
+  const [ty, tm, td] = toIso.split("-").map(Number);
+  return Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(fy, fm - 1, fd)) / 86400000);
+}
+
+function recordTotals() {
+  const today = todayInIndia();
+  if (!today || today < PUZZLE_ONE_DATE) return { total: 0, played: 0, solved: 0 };
+
+  const puzzles = readRecord();
+  let played = 0;
+  let solved = 0;
+
+  Object.keys(puzzles).forEach((date) => {
+    if (!DATE_PATTERN.test(date) || date < PUZZLE_ONE_DATE || date > today) return;
+    played += 1;
+    if (puzzles[date] && puzzles[date].s) solved += 1;
+  });
+
+  return { total: daysBetween(PUZZLE_ONE_DATE, today) + 1, played, solved };
+}
+
+function recordSentence(totals) {
+  return `Out of ${pluralise(totals.total, "puzzle", "puzzles")} so far, you've played ${totals.played} and solved ${totals.solved}.`;
+}
+
+function renderRecord() {
+  const totals = recordTotals();
+  const show = totals.played > 0;
+
+  ["record-welcome", "record-completion"].forEach((id) => {
+    const element = $(id);
+    element.hidden = !show;
+    element.textContent = show ? recordSentence(totals) : "";
+  });
 }
 
 // ---- Receiving a challenge ----
@@ -560,7 +658,13 @@ async function shareResultNatively() {
     });
   } catch (error) {
     // Closing the share sheet is not an error.
-    if (error && error.name === "AbortError") return;
+    if (error && error.name === "AbortError") {
+      trackAnalytics("share_dismissed", {
+        game_name: "Brain Arcade",
+        content: choice
+      });
+      return;
+    }
     await copyResult();
   }
 }
@@ -573,6 +677,11 @@ function saveShareChoice() {
   }
 
   updateSharePreview();
+
+  trackAnalytics("share_choice_changed", {
+    game_name: "Brain Arcade",
+    content: getShareChoice()
+  });
 }
 
 async function startGame() {
@@ -603,6 +712,7 @@ async function startGame() {
     displayGame(data);
   } catch (error) {
     console.error(error);
+    trackError("start", error);
     showError(
       `${error.message} Check your Supabase URL, publishable key and Edge Function deployment.`
     );
@@ -639,6 +749,7 @@ async function submitAnswer(event) {
     // NEW: Record each answer submission without sending the answer text.
     trackAnalytics("answer_submitted", {
       game_name: "Brain Arcade",
+      puzzle_date: data.puzzleDate,
       is_correct: Boolean(data.correct),
       attempt_number: data.attempts
     });
@@ -659,6 +770,7 @@ async function submitAnswer(event) {
     input.focus();
   } catch (error) {
     console.error(error);
+    trackError("guess", error);
     $("feedback").textContent =
       `${error.message} Your answer may not have been recorded.`;
     $("feedback").className = "feedback error";
@@ -693,6 +805,7 @@ async function requestHint() {
       // NEW: Count a hint only when the server returns one.
       trackAnalytics("hint_used", {
         game_name: "Brain Arcade",
+        puzzle_date: data.puzzleDate,
         hint_number: displayedHints.length
       });
     } else {
@@ -704,6 +817,7 @@ async function requestHint() {
     startVisibleTimer(data.elapsedSeconds || 0);
   } catch (error) {
     console.error(error);
+    trackError("hint", error);
     $("feedback").textContent = error.message;
     $("feedback").className = "feedback error";
   } finally {
@@ -724,3 +838,4 @@ $("share-button").addEventListener("click", shareResultNatively);
 $("copy-button").addEventListener("click", copyResult);
 
 renderChallengeBanner();
+renderRecord();
